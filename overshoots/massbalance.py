@@ -8,6 +8,7 @@ import xarray as xr
 
 # Locals
 from oggm import entity_task
+from oggm import utils
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 from oggm.core.massbalance import (MultipleFlowlineMassBalance,
                                    ConstantMassBalance,
@@ -25,12 +26,28 @@ from oggm.cfg import G, GAUSSIAN_KERNEL
 # Module logger
 log = logging.getLogger(__name__)
 
+DT_PER_DT_FILE = 'https://cluster.klima.uni-bremen.de/~fmaussion/misc/magicc/cmip6_dt_per_dt.nc'
+
+
+@entity_task(log)
+def parse_dt_per_dt(gdir):
+    """Local climate change signal for this glacier added to the diagnostics
+    """
+
+    # Use xarray to read the data
+    lon = gdir.cenlon + 360 if gdir.cenlon < 0 else gdir.cenlon
+    lat = gdir.cenlat
+    with xr.open_dataset(utils.file_downloader(DT_PER_DT_FILE)) as ds:
+        assert ds.longitude.min() >= 0
+        ds = ds.sel(longitude=lon, latitude=lat, method='nearest')
+        gdir.add_to_diagnostics('magicc_dt_per_dt', float(ds['cmip6_avg'].data))
+
 
 class MagiccMassBalance(MassBalanceModel):
     """Time-dependant Temp Bias ConstantMassBalance model
     """
 
-    def __init__(self, gdir, magicc_ts=None, mu_star=None, bias=None,
+    def __init__(self, gdir, magicc_ts=None, dt_per_dt=1, mu_star=None, bias=None,
                  y0=None, halfsize=15, filename='climate_historical',
                  input_filesuffix='', **kwargs):
         """Initialize
@@ -50,6 +67,8 @@ class MagiccMassBalance(MassBalanceModel):
         y0 : int, optional, default: tstar
             the year at the center of the period of interest. The default
             is to use tstar as center.
+        dt_per_dt : float, optional, default 1
+            the local climate change signal, in units of °C per °C
         halfsize : int, optional
             the half-size of the time window (window size = 2 * halfsize + 1)
         filename : str, optional
@@ -73,7 +92,8 @@ class MagiccMassBalance(MassBalanceModel):
         self.hemisphere = gdir.hemisphere
 
         # OK now check the bias to apply based on y0 and halfsize
-        self.bias_ts = magicc_ts - magicc_ts.loc[y0-halfsize:y0+halfsize].mean()
+        ref_ts = magicc_ts.loc[y0-halfsize:y0+halfsize]
+        self.bias_ts = (magicc_ts - ref_ts.mean()) * dt_per_dt
 
         # Set ys and ye
         self.ys = int(magicc_ts.index[0])
@@ -126,7 +146,9 @@ class MagiccMassBalance(MassBalanceModel):
 @entity_task(log)
 def run_from_magicc_data(gdir, magicc_ts=None,
                          ys=None, ye=None,
+                         y0=2014, halfsize=5,
                          store_monthly_step=False,
+                         use_dt_per_dt=True,
                          climate_filename='climate_historical',
                          climate_input_filesuffix='', output_filesuffix='',
                          init_model_filesuffix=None, init_model_yr=None,
@@ -139,6 +161,8 @@ def run_from_magicc_data(gdir, magicc_ts=None,
 
     Parameters
     ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory to process
     gdir : :py:class:`oggm.GlacierDirectory`
         the glacier directory to process
     ys : int
@@ -193,8 +217,13 @@ def run_from_magicc_data(gdir, magicc_ts=None,
     if ys is None:
         raise InvalidParamsError('ys should not be guessed at this point')
 
+    dt_per_dt = 1.
+    if use_dt_per_dt:
+        dt_per_dt = gdir.get_diagnostics()['magicc_dt_per_dt']
+
     # Final crop
-    mb = MagiccMassBalance(gdir, magicc_ts=magicc_ts, y0=2008, halfsize=10,
+    mb = MagiccMassBalance(gdir, magicc_ts=magicc_ts, y0=y0, halfsize=halfsize,
+                           dt_per_dt=dt_per_dt,
                            filename=climate_filename, bias=bias,
                            input_filesuffix=climate_input_filesuffix)
 
