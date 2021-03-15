@@ -3,17 +3,21 @@ import logging
 
 # External libs
 import numpy as np
-import shapely.geometry as shpg
+import pandas as pd
 import xarray as xr
 
 # Locals
 from oggm import entity_task
-from oggm import utils
+from oggm import utils, cfg
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 from oggm.core.massbalance import (MultipleFlowlineMassBalance,
                                    ConstantMassBalance,
                                    PastMassBalance,
                                    RandomMassBalance)
+
+from oggm.utils import (SuperclassMeta, lazy_property, floatyear_to_date,
+                        date_to_floatyear, monthly_timeseries, ncDataset,
+                        tolist, clip_min, clip_max, clip_array)
 
 from oggm.core.massbalance import MassBalanceModel, ConstantMassBalance
 from oggm.core.flowline import FileModel, flowline_model_run
@@ -26,7 +30,7 @@ from oggm.cfg import G, GAUSSIAN_KERNEL
 # Module logger
 log = logging.getLogger(__name__)
 
-DT_PER_DT_FILE = 'https://cluster.klima.uni-bremen.de/~fmaussion/misc/magicc/cmip6_dt_per_dt.nc'
+DT_PER_DT_FILE = 'https://cluster.klima.uni-bremen.de/~fmaussion/misc/magicc/cmip_dt_per_dt.nc'
 
 
 @entity_task(log)
@@ -41,6 +45,20 @@ def parse_dt_per_dt(gdir):
         assert ds.longitude.min() >= 0
         ds = ds.sel(longitude=lon, latitude=lat, method='nearest')
         gdir.add_to_diagnostics('magicc_dt_per_dt', float(ds['cmip6_avg'].data))
+
+
+class MagiccConstantMassBalance(ConstantMassBalance):
+    """Just overrides the call to interpolate which is useless here."""
+
+    def get_annual_mb(self, heights, year=None, add_climate=False, **kwargs):
+        mb = heights*0.
+        for yr in self.years:
+            mb += self.mbmod.get_annual_mb(heights, year=yr)
+        mb = mb / len(self.years)
+        if add_climate:
+            t, tmelt, prcp, prcpsol = self.get_climate(heights)
+            return mb, t, tmelt, prcp, prcpsol
+        return mb
 
 
 class MagiccMassBalance(MassBalanceModel):
@@ -82,11 +100,11 @@ class MagiccMassBalance(MassBalanceModel):
             raise InvalidParamsError('Need a magicc ts!')
 
         super(MagiccMassBalance, self).__init__()
-        self.mbmod = ConstantMassBalance(gdir, mu_star=mu_star, bias=bias,
-                                         y0=y0, halfsize=halfsize,
-                                         filename=filename,
-                                         input_filesuffix=input_filesuffix,
-                                         **kwargs)
+        self.mbmod = MagiccConstantMassBalance(gdir, mu_star=mu_star, bias=bias,
+                                               y0=y0, halfsize=halfsize,
+                                               filename=filename,
+                                               input_filesuffix=input_filesuffix,
+                                               **kwargs)
 
         self.valid_bounds = self.mbmod.valid_bounds
         self.hemisphere = gdir.hemisphere
@@ -147,17 +165,12 @@ class MagiccMassBalance(MassBalanceModel):
 def run_from_magicc_data(gdir, magicc_ts=None,
                          ys=None, ye=None,
                          y0=2014, halfsize=5,
-                         store_monthly_step=False,
                          use_dt_per_dt=True,
                          climate_filename='climate_historical',
                          climate_input_filesuffix='', output_filesuffix='',
                          init_model_filesuffix=None, init_model_yr=None,
                          bias=None, **kwargs):
-    """ Runs a glacier with climate input from e.g. CRU or a GCM.
-
-    This will initialize a
-    :py:class:`oggm.core.massbalance.MultipleFlowlineMassBalance`,
-    and run a :py:func:`oggm.core.flowline.flowline_model_run`.
+    """Runs a glacier with climate input from MAGICC.
 
     Parameters
     ----------
@@ -170,9 +183,10 @@ def run_from_magicc_data(gdir, magicc_ts=None,
         date if init_model_filesuffix is None, else init_model_yr)
     ye : int
         end year of the model run (default: last year of the magicc file)
-    store_monthly_step : bool
-        whether to store the diagnostic data at a monthly time step or not
-        (default is yearly)
+    y0 : int
+        central year where to apply the MAGICC anomaly method
+    halfsize : int
+        half-size of the MAGICC anomaly window
     climate_filename : str
         name of the climate file, e.g. 'climate_historical' (default) or
         'gcm_data'
@@ -186,12 +200,6 @@ def run_from_magicc_data(gdir, magicc_ts=None,
     init_model_yr : int
         the year of the initial run you want to start from. The default
         is to take the last year of the simulation.
-    init_model_fls : []
-        list of flowlines to use to initialise the model (the default is the
-        present_time_glacier file from the glacier directory).
-        Ignored if `init_model_filesuffix` is set
-    zero_initial_glacier : bool
-        if true, the ice thickness is set to zero before the simulation
     bias : float
         bias of the mb model. Default is to use the calibrated one, which
         is often a better idea. For t* experiments it can be useful to set it
@@ -201,7 +209,7 @@ def run_from_magicc_data(gdir, magicc_ts=None,
     """
 
     if init_model_filesuffix is not None:
-        fp = gdir.get_filepath('model_run', filesuffix=init_model_filesuffix)
+        fp = gdir.get_filepath('model_geometry', filesuffix=init_model_filesuffix)
         with FileModel(fp) as fmod:
             if init_model_yr is None:
                 init_model_yr = fmod.last_yr
@@ -233,6 +241,5 @@ def run_from_magicc_data(gdir, magicc_ts=None,
 
     return flowline_model_run(gdir, output_filesuffix=output_filesuffix,
                               mb_model=mb, ys=ys, ye=ye,
-                              store_monthly_step=store_monthly_step,
                               init_model_fls=init_model_fls,
                               **kwargs)
