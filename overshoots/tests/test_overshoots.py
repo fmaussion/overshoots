@@ -95,12 +95,12 @@ class TestMassBalanceModels:
             assert_allclose(df[['ens_avg', 'mb']].corr().min().min(), -1, rtol=1e-2)
             assert_allclose(df[['ens_avg', 'mb_nodt']].corr().min().min(), -1, rtol=1e-2)
 
-        if DO_PLOT:
-            plt.figure()
-            df[['mb_ref', 'mb', 'mb_nodt']].loc[2000:2025].plot(title=rid);
-            plt.figure()
-            df[['mb_ref', 'mb', 'mb_nodt']].loc[2000:].plot(title=rid);
-            plt.show()
+            if DO_PLOT:
+                plt.figure()
+                df[['mb_ref', 'mb', 'mb_nodt']].loc[2000:2025].plot(title=rid);
+                plt.figure()
+                df[['mb_ref', 'mb', 'mb_nodt']].loc[2000:].plot(title=rid);
+                plt.show()
 
     def test_varying_bias_workflow(self, case_dir):
 
@@ -131,7 +131,7 @@ class TestMassBalanceModels:
         with xr.open_dataset(gdir.get_filepath('model_diagnostics',
                                                filesuffix='_'+exp)) as ds:
             df['vol'] = ds.volume_m3.to_series()
-            assert ds.time[0] == 2020
+            assert ds.time[0] == 2015
             assert ds.time[-1] == 2301
             assert ds.volume_m3.isel(time=0) > ds.volume_m3.isel(time=-1)
             assert ds.volume_m3.min() < ds.volume_m3.isel(time=-1)
@@ -210,7 +210,7 @@ class TestMassBalanceModels:
 
             # Residual MB should not be crazy large
             frac = odf['residual_mb'] / odf['runoff']
-            assert_allclose(frac, 0, atol=0.1)
+            assert_allclose(frac, 0, atol=0.13)
 
             if DO_PLOT:
                 plt.figure()
@@ -225,4 +225,101 @@ class TestMassBalanceModels:
                 plt.figure()
                 frac.plot(title=rgi_id)
 
+                plt.show()
+
+    def test_hydro_monhly_vs_annual(self, case_dir):
+
+        cfg.initialize()
+        cfg.PARAMS['prcp_scaling_factor'] = 1.6
+        cfg.PATHS['working_dir'] = case_dir
+        cfg.PARAMS['use_multiprocessing'] = True
+        cfg.PARAMS['continue_on_error'] = False
+        cfg.PARAMS['store_diagnostic_variables'] = ['volume', 'area']
+
+        # Go - get the pre-processed glacier directories
+        rgi_ids = ['RGI60-11.00897', 'RGI60-14.06794']
+        gdirs = workflow.init_glacier_directories(rgi_ids,
+                                                  from_prepro_level=5,
+                                                  prepro_base_url=prepro_base_url,
+                                                  prepro_border=80,
+                                                  prepro_rgi_version='62')
+        workflow.execute_entity_task(parse_dt_per_dt, gdirs)
+
+        exp = 'netzero_py2050_fac1.0_decr0.3'
+        magicc_file = magicc_dir + exp + '.nc'
+        with xr.open_dataset(utils.file_downloader(magicc_file), decode_times=False) as ds:
+            ds = ds.load()
+        df = ds['ens_avg'].to_dataframe()
+
+        workflow.execute_entity_task(tasks.run_with_hydro, gdirs,
+                                     store_monthly_hydro=False,
+                                     run_task=run_from_magicc_data,
+                                     magicc_ts=df['ens_avg'],
+                                     init_model_filesuffix='_historical',
+                                     output_filesuffix='_annual')
+
+        workflow.execute_entity_task(tasks.run_with_hydro, gdirs,
+                                     store_monthly_hydro=True,
+                                     run_task=run_from_magicc_data,
+                                     magicc_ts=df['ens_avg'],
+                                     init_model_filesuffix='_historical',
+                                     output_filesuffix='_monthly')
+
+        for gdir in gdirs:
+
+            with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                                   filesuffix='_annual')) as ds:
+                odf_a = ds.to_dataframe()
+
+            with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                                   filesuffix='_monthly')) as ds:
+                sel_vars = [v for v in ds.variables if 'month_2d' not in ds[v].dims]
+                odf_m = ds[sel_vars].to_dataframe()
+                sel_vars = [v for v in ds.variables if 'month_2d' in ds[v].dims]
+
+                odf_ma = ds[sel_vars].isel(time=slice(0, 10)).mean(dim='time').to_dataframe()
+                odf_ma.columns = [c.replace('_monthly', '') for c in odf_ma.columns]
+                odf_ma_e = ds[sel_vars].isel(time=slice(-10, -1)).mean(dim='time').to_dataframe()
+                odf_ma_e.columns = [c.replace('_monthly', '') for c in odf_ma_e.columns]
+
+            # Check that yearly equals monthly
+            np.testing.assert_array_equal(odf_a.columns, odf_m.columns)
+            for c in odf_a.columns:
+                rtol = 1e-5
+                if c == 'melt_off_glacier':
+                    rtol = 0.1
+                if c in ['snow_bucket']:
+                    continue
+
+                # if DO_PLOT:
+                #     f, ax = plt.subplots(1, 1)
+                #     odf_a[c].plot(ax=ax, title=c)
+                #     odf_m[c].plot(ax=ax)
+                #     plt.show()
+
+                assert_allclose(odf_a[c], odf_m[c], rtol=rtol)
+
+            # Check monthly stuff
+            odf_ma['tot_prcp'] = (odf_ma['liq_prcp_off_glacier'] +
+                                  odf_ma['liq_prcp_on_glacier'] +
+                                  odf_ma['snowfall_off_glacier'] +
+                                  odf_ma['snowfall_on_glacier'])
+
+            odf_ma['runoff'] = (odf_ma['melt_on_glacier'] +
+                                odf_ma['melt_off_glacier'] +
+                                odf_ma['liq_prcp_on_glacier'] +
+                                odf_ma['liq_prcp_off_glacier'])
+
+            # Residual MB should not be crazy large
+            frac = odf_ma['residual_mb'] / odf_ma['melt_on_glacier']
+            assert_allclose(frac.loc[~frac.isnull()], 0, atol=0.02)
+
+            if DO_PLOT:
+                rvars = ['melt_on_glacier',
+                        'melt_off_glacier',
+                        'liq_prcp_on_glacier',
+                        'liq_prcp_off_glacier']
+                f, (ax1, ax2) = plt.subplots(2, 1, figsize=(5, 10), sharey=True)
+                odf_ma[rvars].plot.area(ax=ax1, title=gdir.rgi_id + ' begin')
+                odf_ma_e[rvars].plot.area(ax=ax2, title=gdir.rgi_id + ' end')
                 plt.show()

@@ -50,13 +50,25 @@ def parse_dt_per_dt(gdir):
 class MagiccConstantMassBalance(ConstantMassBalance):
     """Just overrides the call to interpolate which is useless here."""
 
+    def get_monthly_mb(self, heights, year=None, add_climate=False, **kwargs):
+        _, m = floatyear_to_date(year)
+        mb_on_h = heights*0.
+        for yr in self.years:
+            yr = date_to_floatyear(yr, m)
+            mb_on_h += self.mbmod.get_monthly_mb(heights, year=yr)
+        mb_on_h /= len(self.years)
+        if add_climate:
+            t, tmelt, prcp, prcpsol = self.get_monthly_climate(heights, year=year)
+            return mb_on_h, t, tmelt, prcp, prcpsol
+        return mb_on_h
+
     def get_annual_mb(self, heights, year=None, add_climate=False, **kwargs):
         mb = heights*0.
         for yr in self.years:
             mb += self.mbmod.get_annual_mb(heights, year=yr)
-        mb = mb / len(self.years)
+        mb /= len(self.years)
         if add_climate:
-            t, tmelt, prcp, prcpsol = self.get_climate(heights)
+            t, tmelt, prcp, prcpsol = self.get_annual_climate(heights)
             return mb, t, tmelt, prcp, prcpsol
         return mb
 
@@ -154,11 +166,11 @@ class MagiccMassBalance(MassBalanceModel):
 
     def get_monthly_mb(self, heights, year=None, **kwargs):
         self._check_bias(year)
-        return self.mbmod.get_monthly_mb(heights, **kwargs)
+        return self.mbmod.get_monthly_mb(heights, year=year, **kwargs)
 
     def get_annual_mb(self, heights, year=None, **kwargs):
         self._check_bias(year)
-        return self.mbmod.get_annual_mb(heights, **kwargs)
+        return self.mbmod.get_annual_mb(heights, year=year, **kwargs)
 
 
 @entity_task(log)
@@ -168,7 +180,7 @@ def run_from_magicc_data(gdir, magicc_ts=None,
                          use_dt_per_dt=True,
                          climate_filename='climate_historical',
                          climate_input_filesuffix='', output_filesuffix='',
-                         init_model_filesuffix=None, init_model_yr=None,
+                         init_model_filesuffix=None, init_model_yr=2015,
                          bias=None, **kwargs):
     """Runs a glacier with climate input from MAGICC.
 
