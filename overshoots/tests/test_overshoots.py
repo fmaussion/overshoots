@@ -92,6 +92,12 @@ class TestMassBalanceModels:
             assert_allclose(df.loc[y0-hs:y0+hs]['mb'].mean(),
                             mbc.get_specific_mb(fls=fls),
                             rtol=5e-3)
+            assert_allclose(df.loc[y0-hs:y0+hs]['mb_ref'].mean(),
+                            df.loc[y0-hs:y0+hs]['mb'].mean(),
+                            atol=1e-2)
+            assert_allclose(df.loc[y0-hs:y0+hs]['mb_ref'].mean(),
+                            df.loc[y0-hs:y0+hs]['mb_nodt'].mean(),
+                            atol=1e-2)
             assert_allclose(df[['ens_avg', 'mb']].corr().min().min(), -1, rtol=1e-2)
             assert_allclose(df[['ens_avg', 'mb_nodt']].corr().min().min(), -1, rtol=1e-2)
 
@@ -131,7 +137,7 @@ class TestMassBalanceModels:
         with xr.open_dataset(gdir.get_filepath('model_diagnostics',
                                                filesuffix='_'+exp)) as ds:
             df['vol'] = ds.volume_m3.to_series()
-            assert ds.time[0] == 2015
+            assert ds.time[0] == 2009
             assert ds.time[-1] == 2301
             assert ds.volume_m3.isel(time=0) > ds.volume_m3.isel(time=-1)
             assert ds.volume_m3.min() < ds.volume_m3.isel(time=-1)

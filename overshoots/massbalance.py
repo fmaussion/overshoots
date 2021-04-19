@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import pandas as pd
 import xarray as xr
+from scipy import optimize
 
 # Locals
 from oggm import entity_task
@@ -121,13 +122,27 @@ class MagiccMassBalance(MassBalanceModel):
         self.valid_bounds = self.mbmod.valid_bounds
         self.hemisphere = gdir.hemisphere
 
-        # OK now check the bias to apply based on y0 and halfsize
-        ref_ts = magicc_ts.loc[y0-halfsize:y0+halfsize]
-        self.bias_ts = (magicc_ts - ref_ts.mean()) * dt_per_dt
-
         # Set ys and ye
         self.ys = int(magicc_ts.index[0])
         self.ye = int(magicc_ts.index[-1])
+
+        # Correct for dt_per_dt signal
+        magicc_ts = magicc_ts * dt_per_dt
+
+        years = magicc_ts.loc[y0-halfsize:y0+halfsize].index.values
+
+        # OK now check the bias to apply based on y0 and halfsize
+        fls = gdir.read_pickle('model_flowlines')
+        mb_ref = PastMassBalance(gdir)
+        mb_ref = mb_ref.get_specific_mb(fls=fls, year=years).mean()
+
+        def to_minimize(temp_bias):
+            self.bias_ts = magicc_ts - temp_bias
+            mb_mine = self.get_specific_mb(fls=fls, year=years).mean()
+            return mb_mine - mb_ref
+
+        temp_bias = optimize.brentq(to_minimize, -10, 10, xtol=1e-5)
+        self.bias_ts = magicc_ts - temp_bias
 
     @property
     def temp_bias(self):
@@ -180,7 +195,7 @@ def run_from_magicc_data(gdir, magicc_ts=None,
                          use_dt_per_dt=True,
                          climate_filename='climate_historical',
                          climate_input_filesuffix='', output_filesuffix='',
-                         init_model_filesuffix=None, init_model_yr=2015,
+                         init_model_filesuffix=None, init_model_yr=None,
                          bias=None, **kwargs):
     """Runs a glacier with climate input from MAGICC.
 
@@ -211,7 +226,7 @@ def run_from_magicc_data(gdir, magicc_ts=None,
         combined with `init_model_yr`
     init_model_yr : int
         the year of the initial run you want to start from. The default
-        is to take the last year of the simulation.
+        is to take the y0 - halfsize
     bias : float
         bias of the mb model. Default is to use the calibrated one, which
         is often a better idea. For t* experiments it can be useful to set it
@@ -220,12 +235,20 @@ def run_from_magicc_data(gdir, magicc_ts=None,
         kwargs to pass to the FluxBasedModel instance
     """
 
+    if init_model_yr is None:
+        init_model_yr = y0 - halfsize
+
     if init_model_filesuffix is not None:
         fp = gdir.get_filepath('model_geometry', filesuffix=init_model_filesuffix)
         with FileModel(fp) as fmod:
             if init_model_yr is None:
                 init_model_yr = fmod.last_yr
-            fmod.run_until(init_model_yr)
+            # Avoid issues here
+            if init_model_yr > fmod.y0:
+                fmod.run_until(init_model_yr)
+            else:
+                fmod.run_until(fmod.y0)
+
             init_model_fls = fmod.fls
             if ys is None:
                 ys = init_model_yr
