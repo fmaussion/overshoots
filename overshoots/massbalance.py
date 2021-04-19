@@ -240,18 +240,18 @@ def run_from_magicc_data(gdir, magicc_ts=None,
 
     if init_model_filesuffix is not None:
         fp = gdir.get_filepath('model_geometry', filesuffix=init_model_filesuffix)
-        with FileModel(fp) as fmod:
-            if init_model_yr is None:
-                init_model_yr = fmod.last_yr
-            # Avoid issues here
-            if init_model_yr > fmod.y0:
-                fmod.run_until(init_model_yr)
-            else:
-                fmod.run_until(fmod.y0)
+        fmod = FileModel(fp)
+        if init_model_yr is None:
+            init_model_yr = fmod.last_yr
+        # Avoid issues here
+        if init_model_yr > fmod.y0:
+            fmod.run_until(init_model_yr)
+        else:
+            fmod.run_until(fmod.y0)
 
-            init_model_fls = fmod.fls
-            if ys is None:
-                ys = init_model_yr
+        init_model_fls = fmod.fls
+        if ys is None:
+            ys = init_model_yr
     else:
         raise InvalidParamsError('We strongly recommend to start from '
                                  'prepro for this task.')
