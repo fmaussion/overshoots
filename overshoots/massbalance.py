@@ -31,21 +31,39 @@ from oggm.cfg import G, GAUSSIAN_KERNEL
 # Module logger
 log = logging.getLogger(__name__)
 
-DT_PER_DT_FILE = 'https://cluster.klima.uni-bremen.de/~fmaussion/misc/magicc/cmip_dt_per_dt.nc'
+cluster_url = 'https://cluster.klima.uni-bremen.de/~fmaussion/misc/magicc/scaling/'
+DT_PER_DT_FILE = cluster_url + 'cmip_dt_per_dt_small.nc'
+DT_PER_DT_MON_FILE = cluster_url + 'cmip_dt_per_dt_monthly_small.nc'
+DP_PER_DT_FILE = cluster_url + 'cmip_dp_per_dt_small.nc'
+DP_PER_DT_MON_FILE = cluster_url + 'cmip_dp_per_dt_monthly_small.nc'
 
 
 @entity_task(log)
-def parse_dt_per_dt(gdir):
+def parse_dt_per_dt(gdir, monthly=False):
     """Local climate change signal for this glacier added to the diagnostics
     """
 
     # Use xarray to read the data
     lon = gdir.cenlon + 360 if gdir.cenlon < 0 else gdir.cenlon
     lat = gdir.cenlat
-    with xr.open_dataset(utils.file_downloader(DT_PER_DT_FILE)) as ds:
+
+    if monthly:
+        convert = list
+        tf = DT_PER_DT_MON_FILE
+        tp = DP_PER_DT_MON_FILE
+    else:
+        convert = float
+        tf = DT_PER_DT_FILE
+        tp = DP_PER_DT_FILE
+
+    with xr.open_dataset(utils.file_downloader(tf)) as ds:
         assert ds.longitude.min() >= 0
         ds = ds.sel(longitude=lon, latitude=lat, method='nearest')
-        gdir.add_to_diagnostics('magicc_dt_per_dt', float(ds['cmip6_avg'].data))
+        gdir.add_to_diagnostics('magicc_dt_per_dt', convert(ds['cmip_avg'].data))
+    with xr.open_dataset(utils.file_downloader(tp)) as ds:
+        assert ds.longitude.min() >= 0
+        ds = ds.sel(longitude=lon, latitude=lat, method='nearest')
+        gdir.add_to_diagnostics('magicc_dp_per_dt', convert(ds['cmip_avg'].data))
 
 
 class MagiccConstantMassBalance(ConstantMassBalance):
@@ -78,7 +96,8 @@ class MagiccMassBalance(MassBalanceModel):
     """Time-dependant Temp Bias ConstantMassBalance model
     """
 
-    def __init__(self, gdir, magicc_ts=None, dt_per_dt=1, mu_star=None, bias=None,
+    def __init__(self, gdir, magicc_ts=None, dt_per_dt=1, dp_per_dt=0,
+                 mu_star=None, bias=None,
                  y0=None, halfsize=15, filename='climate_historical',
                  input_filesuffix='', **kwargs):
         """Initialize
@@ -126,8 +145,24 @@ class MagiccMassBalance(MassBalanceModel):
         self.ys = int(magicc_ts.index[0])
         self.ye = int(magicc_ts.index[-1])
 
+        # Correct for dp_per_dt signal
+        if len(np.atleast_1d(dp_per_dt)) == 12:
+            ref_t = magicc_ts.loc[y0-halfsize:y0+halfsize].mean()
+            prcp_ts = (magicc_ts - ref_t).values[:, np.newaxis] * dp_per_dt
+            prcp_ts = pd.DataFrame(data=prcp_ts, index=magicc_ts.index, columns=np.arange(1, 13))
+        else:
+            ref_t = magicc_ts.loc[y0-halfsize:y0+halfsize].mean()
+            prcp_ts = (magicc_ts - ref_t) * dp_per_dt
+
+        # We correct the original factor - don't forget to also scale the diff
+        self.prcp_fac_ts = self.mbmod.prcp_fac + self.mbmod.prcp_fac * prcp_ts
+
         # Correct for dt_per_dt signal
-        magicc_ts = magicc_ts * dt_per_dt
+        if len(np.atleast_1d(dt_per_dt)) == 12:
+            magicc_ts = pd.DataFrame(data=magicc_ts.values[:, np.newaxis] * dt_per_dt,
+                                     index=magicc_ts.index, columns=np.arange(1, 13))
+        else:
+            magicc_ts = magicc_ts * dt_per_dt
 
         years = magicc_ts.loc[y0-halfsize:y0+halfsize].index.values
 
@@ -137,12 +172,12 @@ class MagiccMassBalance(MassBalanceModel):
         mb_ref = mb_ref.get_specific_mb(fls=fls, year=years).mean()
 
         def to_minimize(temp_bias):
-            self.bias_ts = magicc_ts - temp_bias
+            self.temp_bias_ts = magicc_ts - temp_bias
             mb_mine = self.get_specific_mb(fls=fls, year=years).mean()
             return mb_mine - mb_ref
 
         temp_bias = optimize.brentq(to_minimize, -10, 10, xtol=1e-5)
-        self.bias_ts = magicc_ts - temp_bias
+        self.temp_bias_ts = magicc_ts - temp_bias
 
     @property
     def temp_bias(self):
@@ -155,14 +190,14 @@ class MagiccMassBalance(MassBalanceModel):
         self.mbmod.temp_bias = value
 
     @property
-    def prcp_bias(self):
+    def prcp_fac(self):
         """Precipitation factor to apply to the original series."""
-        return self.mbmod.prcp_bias
+        return self.mbmod.prcp_fac
 
-    @prcp_bias.setter
-    def prcp_bias(self, value):
+    @prcp_fac.setter
+    def prcp_fac(self, value):
         """Precipitation factor to apply to the original series."""
-        self.mbmod.prcp_bias = value
+        self.mbmod.prcp_fac = value
 
     @property
     def bias(self):
@@ -175,9 +210,12 @@ class MagiccMassBalance(MassBalanceModel):
         self.mbmod.bias = value
 
     def _check_bias(self, year):
-        magicc_bias = self.bias_ts.loc[int(year)]
-        if magicc_bias != self.temp_bias:
-            self.temp_bias = magicc_bias
+        t = np.asarray(self.temp_bias_ts.loc[int(year)])
+        if np.any(t != self.temp_bias):
+            self.temp_bias = t
+        p = np.asarray(self.prcp_fac_ts.loc[int(year)])
+        if np.any(p != self.prcp_fac):
+            self.prcp_fac = p
 
     def get_monthly_mb(self, heights, year=None, **kwargs):
         self._check_bias(year)
@@ -193,6 +231,7 @@ def run_from_magicc_data(gdir, magicc_ts=None,
                          ys=None, ye=None,
                          y0=2014, halfsize=5,
                          use_dt_per_dt=True,
+                         use_dp_per_dt=True,
                          climate_filename='climate_historical',
                          climate_input_filesuffix='', output_filesuffix='',
                          init_model_filesuffix=None, init_model_yr=None,
@@ -261,12 +300,15 @@ def run_from_magicc_data(gdir, magicc_ts=None,
         raise InvalidParamsError('ys should not be guessed at this point')
 
     dt_per_dt = 1.
+    dp_per_dt = 0.
     if use_dt_per_dt:
-        dt_per_dt = gdir.get_diagnostics()['magicc_dt_per_dt']
+        dt_per_dt = np.asarray(gdir.get_diagnostics()['magicc_dt_per_dt'])
+    if use_dp_per_dt:
+        dp_per_dt = np.asarray(gdir.get_diagnostics()['magicc_dp_per_dt'])
 
     # Final crop
     mb = MagiccMassBalance(gdir, magicc_ts=magicc_ts, y0=y0, halfsize=halfsize,
-                           dt_per_dt=dt_per_dt,
+                           dt_per_dt=dt_per_dt, dp_per_dt=dp_per_dt,
                            filename=climate_filename, bias=bias,
                            input_filesuffix=climate_input_filesuffix)
 

@@ -19,9 +19,16 @@ from overshoots.massbalance import MagiccMassBalance, run_from_magicc_data, pars
 
 prepro_base_url = ('https://cluster.klima.uni-bremen.de/~oggm/gdirs/oggm_v1.4/'
                    'L3-L5_files/ERA5/elev_bands/qc3/pcp1.6/match_geod/')
-magicc_dir = 'https://cluster.klima.uni-bremen.de/~fmaussion/misc/magicc/magicc_ensemble_sel/'
+magicc_dir = 'https://cluster.klima.uni-bremen.de/~fmaussion/misc/magicc/magicc_ensemble_sel_quantiles/'
 
 DO_PLOT = True
+
+ALL_DIAGS = ['volume', 'volume_bsl', 'volume_bwl', 'area', 'length',
+             'calving', 'calving_rate', 'off_area', 'on_area', 'melt_off_glacier',
+             'melt_on_glacier', 'liq_prcp_off_glacier', 'liq_prcp_on_glacier',
+             'snowfall_off_glacier', 'snowfall_on_glacier', 'model_mb',
+             'residual_mb', 'snow_bucket']
+
 
 class TestMassBalanceModels:
 
@@ -43,6 +50,25 @@ class TestMassBalanceModels:
         dt1 = gdirs[0].get_diagnostics()['magicc_dt_per_dt']
         dt2 = gdirs[1].get_diagnostics()['magicc_dt_per_dt']
         assert dt1 < 0.7 * dt2
+
+        dp1 = gdirs[0].get_diagnostics()['magicc_dp_per_dt']
+        dp2 = gdirs[1].get_diagnostics()['magicc_dp_per_dt']
+        assert dp1 < dp2
+        assert dp2 < 0.2
+
+        workflow.execute_entity_task(parse_dt_per_dt, gdirs, monthly=True)
+
+        dt1m = np.asarray(gdirs[0].get_diagnostics()['magicc_dt_per_dt'])
+        dt2m = np.asarray(gdirs[1].get_diagnostics()['magicc_dt_per_dt'])
+        assert_allclose(dt1m.mean(), dt1, atol=1e-3)
+        assert_allclose(dt2m.mean(), dt2, atol=1e-3)
+
+        dp1m = np.asarray(gdirs[0].get_diagnostics()['magicc_dp_per_dt'])
+        dp2m = np.asarray(gdirs[1].get_diagnostics()['magicc_dp_per_dt'])
+        # This is not always so the same because of averaging months with
+        # different precips
+        assert_allclose(dp1m.mean(), dp1, atol=3e-2)
+        assert_allclose(dp2m.mean(), dp2, atol=3e-2)
 
     def test_varying_bias_mb_model(self, case_dir):
 
@@ -68,6 +94,7 @@ class TestMassBalanceModels:
                 ds = ds.load()
             df = ds['ens_avg'].to_dataframe()
             dt_per_dt = gdir.get_diagnostics()['magicc_dt_per_dt']
+            dp_per_dt = gdir.get_diagnostics()['magicc_dp_per_dt']
 
             fls = gdir.read_pickle('model_flowlines')
 
@@ -86,6 +113,12 @@ class TestMassBalanceModels:
             df['mb'] = mb.get_specific_mb(fls=fls, year=df.index)
 
             mb = MagiccMassBalance(gdir, y0=y0, halfsize=hs,
+                                   magicc_ts=df['ens_avg'],
+                                   dt_per_dt=dt_per_dt,
+                                   dp_per_dt=dp_per_dt)
+            df['mb_wp'] = mb.get_specific_mb(fls=fls, year=df.index)
+
+            mb = MagiccMassBalance(gdir, y0=y0, halfsize=hs,
                                    magicc_ts=df['ens_avg'])
             df['mb_nodt'] = mb.get_specific_mb(fls=fls, year=df.index)
 
@@ -96,16 +129,98 @@ class TestMassBalanceModels:
                             df.loc[y0-hs:y0+hs]['mb'].mean(),
                             atol=1e-2)
             assert_allclose(df.loc[y0-hs:y0+hs]['mb_ref'].mean(),
+                            df.loc[y0-hs:y0+hs]['mb_wp'].mean(),
+                            atol=1e-2)
+            assert_allclose(df.loc[y0-hs:y0+hs]['mb_ref'].mean(),
                             df.loc[y0-hs:y0+hs]['mb_nodt'].mean(),
                             atol=1e-2)
             assert_allclose(df[['ens_avg', 'mb']].corr().min().min(), -1, rtol=1e-2)
             assert_allclose(df[['ens_avg', 'mb_nodt']].corr().min().min(), -1, rtol=1e-2)
+            assert_allclose(df[['mb_wp', 'mb']].corr().min().min(), 1, rtol=1e-2)
+            assert_allclose(df['mb'], df['mb_wp'], atol=115)
 
             if DO_PLOT:
                 plt.figure()
-                df[['mb_ref', 'mb', 'mb_nodt']].loc[2000:2025].plot(title=rid);
+                df[['mb_ref', 'mb', 'mb_wp', 'mb_nodt']].loc[2000:2025].plot(title=rid);
                 plt.figure()
-                df[['mb_ref', 'mb', 'mb_nodt']].loc[2000:].plot(title=rid);
+                df[['mb_ref', 'mb', 'mb_wp', 'mb_nodt']].loc[2000:].plot(title=rid);
+                plt.show()
+
+    def test_monthly_varying_bias_mb_model(self, case_dir):
+
+        cfg.initialize()
+        cfg.PARAMS['prcp_scaling_factor'] = 1.6
+        cfg.PATHS['working_dir'] = case_dir
+        cfg.PARAMS['use_multiprocessing'] = True
+
+        # Go - get the pre-processed glacier directories
+        for rid in ['RGI60-03.04384', 'RGI60-11.00897', 'RGI60-16.02207']:
+            gdirs = workflow.init_glacier_directories([rid],
+                                                      from_prepro_level=5,
+                                                      prepro_base_url=prepro_base_url,
+                                                      prepro_border=80,
+                                                      prepro_rgi_version='62')
+
+            workflow.execute_entity_task(parse_dt_per_dt, gdirs, monthly=True)
+
+            gdir = gdirs[0]
+
+            exp = 'netzero_py2020_fac1.0_decr0.3'
+            magicc_file = magicc_dir + exp + '.nc'
+            with xr.open_dataset(utils.file_downloader(magicc_file), decode_times=False) as ds:
+                ds = ds.load()
+            df = ds['ens_avg'].to_dataframe()
+            dt_per_dt = np.asarray(gdir.get_diagnostics()['magicc_dt_per_dt'])
+            dp_per_dt = np.asarray(gdir.get_diagnostics()['magicc_dp_per_dt'])
+
+            fls = gdir.read_pickle('model_flowlines')
+
+            y0 = 2014
+            hs = 5
+
+            mbc = massbalance.ConstantMassBalance(gdir, y0=y0, halfsize=hs)
+            mb_ref = massbalance.PastMassBalance(gdir)
+            years = np.arange(1980, 2020, dtype=np.float64)
+            df['mb_ref'] = pd.Series(index=years,
+                                     data=mb_ref.get_specific_mb(fls=fls, year=years))
+
+            mb = MagiccMassBalance(gdir, y0=y0, halfsize=hs,
+                                   magicc_ts=df['ens_avg'],
+                                   dt_per_dt=dt_per_dt)
+            df['mb'] = mb.get_specific_mb(fls=fls, year=df.index)
+
+            mb = MagiccMassBalance(gdir, y0=y0, halfsize=hs,
+                                   magicc_ts=df['ens_avg'],
+                                   dt_per_dt=dt_per_dt,
+                                   dp_per_dt=dp_per_dt)
+            df['mb_wp'] = mb.get_specific_mb(fls=fls, year=df.index)
+
+            mb = MagiccMassBalance(gdir, y0=y0, halfsize=hs,
+                                   magicc_ts=df['ens_avg'])
+            df['mb_nodt'] = mb.get_specific_mb(fls=fls, year=df.index)
+
+            assert_allclose(df.loc[y0 - hs:y0 + hs]['mb'].mean(),
+                            mbc.get_specific_mb(fls=fls),
+                            rtol=5e-3)
+            assert_allclose(df.loc[y0 - hs:y0 + hs]['mb_ref'].mean(),
+                            df.loc[y0 - hs:y0 + hs]['mb'].mean(),
+                            atol=1e-2)
+            assert_allclose(df.loc[y0 - hs:y0 + hs]['mb_ref'].mean(),
+                            df.loc[y0 - hs:y0 + hs]['mb_wp'].mean(),
+                            atol=1e-2)
+            assert_allclose(df.loc[y0 - hs:y0 + hs]['mb_ref'].mean(),
+                            df.loc[y0 - hs:y0 + hs]['mb_nodt'].mean(),
+                            atol=1e-2)
+            assert_allclose(df[['ens_avg', 'mb']].corr().min().min(), -1, rtol=1e-2)
+            assert_allclose(df[['ens_avg', 'mb_nodt']].corr().min().min(), -1, rtol=1e-2)
+            assert_allclose(df[['mb_wp', 'mb']].corr().min().min(), 1, rtol=1e-2)
+            assert_allclose(df['mb'], df['mb_wp'], atol=120)
+
+            if DO_PLOT:
+                plt.figure()
+                df[['mb_ref', 'mb', 'mb_wp', 'mb_nodt']].loc[2000:2025].plot(title=rid);
+                plt.figure()
+                df[['mb_ref', 'mb', 'mb_wp', 'mb_nodt']].loc[2000:].plot(title=rid);
                 plt.show()
 
     def test_varying_bias_workflow(self, case_dir):
@@ -142,13 +257,59 @@ class TestMassBalanceModels:
             assert ds.volume_m3.isel(time=0) > ds.volume_m3.isel(time=-1)
             assert ds.volume_m3.min() < ds.volume_m3.isel(time=-1)
 
-    def test_hydro_workflow(self, case_dir):
+    def test_ensemble_workflow(self, case_dir):
 
         cfg.initialize()
         cfg.PARAMS['prcp_scaling_factor'] = 1.6
         cfg.PATHS['working_dir'] = case_dir
         cfg.PARAMS['use_multiprocessing'] = True
         cfg.PARAMS['store_diagnostic_variables'] = ['volume', 'area']
+
+        # Go - get the pre-processed glacier directories
+        rgi_ids = ['RGI60-03.04384']
+        gdirs = workflow.init_glacier_directories(rgi_ids,
+                                                  from_prepro_level=5,
+                                                  prepro_base_url=prepro_base_url,
+                                                  prepro_border=80,
+                                                  prepro_rgi_version='62')
+        workflow.execute_entity_task(parse_dt_per_dt, gdirs)
+
+        exp = 'netzero_py2050_fac1.0_decr0.3'
+        magicc_file = magicc_dir + exp + '.nc'
+        with xr.open_dataset(utils.file_downloader(magicc_file), decode_times=False) as ds:
+            ds = ds.load()
+
+        odf = pd.DataFrame()
+        for q in ds['quantile'].data:
+
+            df = ds.global_mean_temperature.sel(quantile=q).to_series()
+
+            workflow.execute_entity_task(tasks.run_with_hydro, gdirs,
+                                         run_task=run_from_magicc_data,
+                                         magicc_ts=df,
+                                         init_model_filesuffix='_historical',
+                                         output_filesuffix='_{:.2f}'.format(q))
+
+            ods = utils.compile_run_output(gdirs, filesuffix='_{:.2f}'.format(q))
+            odf[q] = ods.volume.isel(rgi_id=0).to_series()
+
+        odf = odf / odf.iloc[0, 0]
+
+        assert odf.loc[2150].std() > 0.05
+        assert_allclose(odf.loc[2010].std(), 0, atol=1e-3)
+        assert_allclose(odf.loc[2300].std(), 0, atol=1e-2)
+
+        if DO_PLOT:
+            odf.plot(title='Ensemble stuff')
+            plt.show()
+
+    def test_hydro_workflow(self, case_dir):
+
+        cfg.initialize()
+        cfg.PARAMS['prcp_scaling_factor'] = 1.6
+        cfg.PATHS['working_dir'] = case_dir
+        cfg.PARAMS['use_multiprocessing'] = True
+        cfg.PARAMS['store_diagnostic_variables'] = ALL_DIAGS
 
         # Go - get the pre-processed glacier directories
         rgi_ids = ['RGI60-14.06794', 'RGI60-11.00897']
@@ -166,8 +327,10 @@ class TestMassBalanceModels:
         df = ds['ens_avg'].to_dataframe()
 
         workflow.execute_entity_task(tasks.run_with_hydro, gdirs,
+                                     ref_area_from_y0=True,
                                      run_task=run_from_magicc_data,
                                      magicc_ts=df['ens_avg'],
+                                     use_dp_per_dt=False,
                                      init_model_filesuffix='_historical',
                                      output_filesuffix='_' + exp)
 
@@ -182,7 +345,7 @@ class TestMassBalanceModels:
                                odf['liq_prcp_on_glacier'] +
                                odf['snowfall_off_glacier'] +
                                odf['snowfall_on_glacier'])
-            assert_allclose(odf['tot_prcp'], odf['tot_prcp'].iloc[0])
+            assert_allclose(odf['tot_prcp'], odf['tot_prcp'].iloc[0], rtol=1e-4)
 
             # Glacier area is the same (remove on_area?)
             assert_allclose(odf['on_area'], odf['area'])
@@ -240,7 +403,7 @@ class TestMassBalanceModels:
         cfg.PATHS['working_dir'] = case_dir
         cfg.PARAMS['use_multiprocessing'] = True
         cfg.PARAMS['continue_on_error'] = False
-        cfg.PARAMS['store_diagnostic_variables'] = ['volume', 'area']
+        cfg.PARAMS['store_diagnostic_variables'] = ALL_DIAGS
 
         # Go - get the pre-processed glacier directories
         rgi_ids = ['RGI60-11.00897', 'RGI60-14.06794']
@@ -261,6 +424,7 @@ class TestMassBalanceModels:
                                      store_monthly_hydro=False,
                                      run_task=run_from_magicc_data,
                                      magicc_ts=df['ens_avg'],
+                                     use_dp_per_dt=False,
                                      init_model_filesuffix='_historical',
                                      output_filesuffix='_annual')
 
@@ -268,6 +432,7 @@ class TestMassBalanceModels:
                                      store_monthly_hydro=True,
                                      run_task=run_from_magicc_data,
                                      magicc_ts=df['ens_avg'],
+                                     use_dp_per_dt=False,
                                      init_model_filesuffix='_historical',
                                      output_filesuffix='_monthly')
 
@@ -326,6 +491,116 @@ class TestMassBalanceModels:
                         'liq_prcp_on_glacier',
                         'liq_prcp_off_glacier']
                 f, (ax1, ax2) = plt.subplots(2, 1, figsize=(5, 10), sharey=True)
-                odf_ma[rvars].plot.area(ax=ax1, title=gdir.rgi_id + ' begin')
-                odf_ma_e[rvars].plot.area(ax=ax2, title=gdir.rgi_id + ' end')
+                odf_ma[rvars].clip(0).plot.area(ax=ax1, title=gdir.rgi_id + ' begin')
+                odf_ma_e[rvars].clip(0).plot.area(ax=ax2, title=gdir.rgi_id + ' end')
+                plt.show()
+
+    def test_scaling_monhly_vs_annual(self, case_dir):
+
+        cfg.initialize()
+        cfg.PARAMS['prcp_scaling_factor'] = 1.6
+        cfg.PATHS['working_dir'] = case_dir
+        cfg.PARAMS['use_multiprocessing'] = True
+        cfg.PARAMS['continue_on_error'] = False
+        cfg.PARAMS['store_diagnostic_variables'] = ALL_DIAGS
+
+        # Go - get the pre-processed glacier directories
+        rgi_ids = ['RGI60-11.00897', 'RGI60-14.06794']
+        gdirs = workflow.init_glacier_directories(rgi_ids,
+                                                  from_prepro_level=5,
+                                                  prepro_base_url=prepro_base_url,
+                                                  prepro_border=80,
+                                                  prepro_rgi_version='62')
+
+        exp = 'netzero_py2050_fac1.0_decr0.3'
+        magicc_file = magicc_dir + exp + '.nc'
+        with xr.open_dataset(utils.file_downloader(magicc_file), decode_times=False) as ds:
+            ds = ds.load()
+        df = ds['ens_avg'].to_dataframe()
+
+        # Default is annual
+        workflow.execute_entity_task(parse_dt_per_dt, gdirs)
+        workflow.execute_entity_task(tasks.run_with_hydro, gdirs,
+                                     store_monthly_hydro=True,
+                                     run_task=run_from_magicc_data,
+                                     magicc_ts=df['ens_avg'],
+                                     init_model_filesuffix='_historical',
+                                     output_filesuffix='_annual')
+
+        # Monthly
+        workflow.execute_entity_task(parse_dt_per_dt, gdirs, monthly=True)
+        workflow.execute_entity_task(tasks.run_with_hydro, gdirs,
+                                     store_monthly_hydro=True,
+                                     run_task=run_from_magicc_data,
+                                     magicc_ts=df['ens_avg'],
+                                     init_model_filesuffix='_historical',
+                                     output_filesuffix='_monthly')
+
+        for gdir in gdirs:
+
+            with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                                   filesuffix='_annual')) as ds:
+                sel_vars = [v for v in ds.variables if 'month_2d' not in ds[v].dims]
+                odf_a = ds[sel_vars].to_dataframe()
+                sel_vars = [v for v in ds.variables if 'month_2d' in ds[v].dims]
+
+                odf_ma = ds[sel_vars].isel(time=slice(0, 10)).mean(dim='time').to_dataframe()
+                odf_ma.columns = [c.replace('_monthly', '') for c in odf_ma.columns]
+                odf_ma_e = ds[sel_vars].isel(time=slice(-10, -1)).mean(dim='time').to_dataframe()
+                odf_ma_e.columns = [c.replace('_monthly', '') for c in odf_ma_e.columns]
+
+            with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                                   filesuffix='_monthly')) as ds:
+                sel_vars = [v for v in ds.variables if 'month_2d' not in ds[v].dims]
+                odf_m = ds[sel_vars].to_dataframe()
+                sel_vars = [v for v in ds.variables if 'month_2d' in ds[v].dims]
+
+                odf_mm = ds[sel_vars].isel(time=slice(0, 10)).mean(dim='time').to_dataframe()
+                odf_mm.columns = [c.replace('_monthly', '') for c in odf_ma.columns]
+                odf_mm_e = ds[sel_vars].isel(time=slice(-10, -1)).mean(dim='time').to_dataframe()
+                odf_mm_e.columns = [c.replace('_monthly', '') for c in odf_ma_e.columns]
+
+            # Check annual and monthly stuff
+            for _df in [odf_ma, odf_ma_e, odf_mm, odf_mm_e]:
+                _df['tot_prcp'] = (_df['liq_prcp_off_glacier'] +
+                                   _df['liq_prcp_on_glacier'] +
+                                   _df['snowfall_off_glacier'] +
+                                   _df['snowfall_on_glacier'])
+                _df['runoff'] = (_df['melt_on_glacier'] +
+                                 _df['melt_off_glacier'] +
+                                 _df['liq_prcp_on_glacier'] +
+                                 _df['liq_prcp_off_glacier'])
+
+            # Residual MB should not be crazy large
+            # frac = odf_ma['residual_mb'] / odf_ma['melt_on_glacier']
+            # assert_allclose(frac.loc[~frac.isnull()], 0, atol=0.02)
+
+            fac_a = odf_ma_e.tot_prcp / odf_ma.tot_prcp
+            assert_allclose(fac_a, fac_a.iloc[0])
+
+            fac_m = odf_mm_e.tot_prcp / odf_mm.tot_prcp
+            # Here this is not the same!
+            assert_allclose(fac_m, fac_m.iloc[0], rtol=0.1)
+            # Check that the number of months with + and - is the same
+            dp_dt = np.asarray(gdir.get_diagnostics()['magicc_dp_per_dt'])
+            assert np.sum(fac_m > 1) == np.sum(dp_dt > 0)
+
+            if DO_PLOT:
+                rvars = ['melt_on_glacier',
+                        'melt_off_glacier',
+                        'liq_prcp_on_glacier',
+                        'liq_prcp_off_glacier']
+                f, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharey=True)
+                odf_mm[rvars].clip(0).plot.area(ax=ax1, title=gdir.rgi_id + ' begin')
+                odf_mm_e[rvars].clip(0).plot.area(ax=ax2, title=gdir.rgi_id + ' end')
+                plt.tight_layout()
+
+                rvars = ['snowfall_on_glacier',
+                         'snowfall_off_glacier',
+                         'liq_prcp_on_glacier',
+                         'liq_prcp_off_glacier']
+                f, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharey=True)
+                odf_mm[rvars].clip(0).plot.area(ax=ax1, title=gdir.rgi_id + ' begin')
+                odf_mm_e[rvars].clip(0).plot.area(ax=ax2, title=gdir.rgi_id + ' end')
+                plt.tight_layout()
                 plt.show()
